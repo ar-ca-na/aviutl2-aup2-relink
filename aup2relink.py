@@ -10,6 +10,7 @@ import datetime
 import ntpath
 import os
 import re
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -21,6 +22,7 @@ SKIP_SECTIONS = {"project"}          # [project] の file= は .aup2 自身の�
 SKIP_KEYS = {"テキスト", "output.file"}
 ABS_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
 SEP = re.compile(r"[\\/]+")
+FONTS = ("TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont")
 
 
 # ---------------------------------------------------------------- .aup2 の読み書き
@@ -76,6 +78,13 @@ def collect_aup2(paths):
         elif p.lower().endswith(".aup2") and os.path.isfile(p):
             out.append(p)
     return sorted(set(os.path.normpath(p) for p in out))
+
+
+def doc_labels(paths):
+    """一覧に出す .aup2 の名前。ファイル名が重なるものだけ親フォルダ名を付ける。"""
+    names = [ntpath.basename(p) for p in paths]
+    return [n if names.count(n) == 1 else ntpath.join(ntpath.basename(ntpath.dirname(p)), n)
+            for p, n in zip(paths, names)]
 
 
 # ---------------------------------------------------------------- 移動先の推定
@@ -137,6 +146,43 @@ user32.GetWindowTextW.argtypes = [W.HWND, W.LPWSTR, ctypes.c_int]
 user32.IsWindowVisible.argtypes = [W.HWND]
 user32.GetDpiForWindow.argtypes = [W.HWND]
 user32.GetDpiForWindow.restype = W.UINT
+MONITORENUMPROC = ctypes.WINFUNCTYPE(W.BOOL, W.HMONITOR, W.HDC, ctypes.POINTER(W.RECT), W.LPARAM)
+user32.EnumDisplayMonitors.argtypes = [W.HDC, ctypes.c_void_p, MONITORENUMPROC, W.LPARAM]
+user32.EnumDisplayMonitors.restype = W.BOOL
+
+
+def window_scale(root):
+    """窓が今いるモニタの拡大率（100% = 1.0）。"""
+    return user32.GetDpiForWindow(int(root.wm_frame(), 16)) / 96 or 1
+
+
+def min_scale():
+    """全モニタのうち一番小さい拡大率。"""
+    shcore = ctypes.windll.shcore
+    shcore.GetDpiForMonitor.argtypes = [W.HMONITOR, ctypes.c_int, ctypes.POINTER(W.UINT), ctypes.POINTER(W.UINT)]
+    shcore.GetDpiForMonitor.restype = ctypes.c_long
+    dpis = []
+
+    def cb(h, dc, r, _):
+        x, y = W.UINT(), W.UINT()
+        if shcore.GetDpiForMonitor(h, 0, ctypes.byref(x), ctypes.byref(y)) == 0:
+            dpis.append(x.value)
+        return True
+
+    user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(cb), 0)
+    return min(dpis, default=96) / 96
+
+
+def load_dpihook():
+    """WM_DPICHANGED を処理する小さな DLL（dpihook.c）。読めなければ None。"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    try:
+        dll = ctypes.CDLL(os.path.join(base, "dpihook.dll"))
+    except OSError:
+        return None
+    dll.hook_dpi_changed.argtypes = [W.HWND]
+    dll.hook_dpi_changed.restype = ctypes.c_int
+    return dll
 
 
 def aviutl2_titles():
@@ -158,30 +204,30 @@ def aviutl2_titles():
 # ---------------------------------------------------------------- 画面
 
 class App:
-    COLS = (("state", "状態", 90), ("name", "ファイル名", 170), ("old", "元の場所（見つからない）", 330),
-            ("new", "新しい場所", 330), ("count", "使用数", 50))
+    # 幅の合計は窓の初期幅（1040）に収める。「プロジェクト」列を隠したぶんは old / new が伸びて埋める
+    COLS = (("state", "状態", 80), ("name", "ファイル名", 150), ("proj", "プロジェクト", 160),
+            ("old", "元の場所（見つからない）", 260), ("new", "新しい場所", 260), ("count", "使用数", 60))
 
     def __init__(self, root, S):
         self.root, self.S = root, S
         self.docs = []
-        self.rows = {}        # 旧パス -> {"count", "new", "note"}
+        self.rows = {}        # 旧パス -> {"count", "new", "note", "proj"}
         self.total = 0
         self.job = None       # (thread, cancel, state)
+        self.hooked = False   # WM_DPICHANGED を DLL で受けているか
         root.title(APP)
         root.geometry(f"{int(1040 * S)}x{int(540 * S)}")
-        root.minsize(int(640 * S), int(320 * S))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        p = int(6 * S)
 
-        top = ttk.Frame(root, padding=p)
-        top.pack(fill="x")
-        ttk.Button(top, text="aup2 を開く…", command=self.ask_open).pack(side="left")
-        self.info = ttk.Label(top, text="ここに .aup2（またはフォルダ）をドロップ")
-        self.info.pack(side="left", padx=p)
+        self.top = ttk.Frame(root)
+        self.top.pack(fill="x")
+        ttk.Button(self.top, text="aup2 を開く…", command=self.ask_open).pack(side="left")
+        self.info = ttk.Label(self.top, text="ここに .aup2（またはフォルダ）をドロップ")
+        self.info.pack(side="left")
 
-        mid = ttk.Frame(root, padding=(p, 0))
-        mid.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(mid, columns=[c[0] for c in self.COLS], show="headings", selectmode="extended")
+        self.mid = ttk.Frame(root)
+        self.mid.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(self.mid, columns=[c[0] for c in self.COLS], show="headings", selectmode="extended")
         for key, label, w in self.COLS:
             self.tree.heading(key, text=label, anchor="w")
             self.tree.column(key, width=int(w * S), anchor="e" if key == "count" else "w",
@@ -189,26 +235,75 @@ class App:
         self.tree.tag_configure("none", foreground="#b00020")
         self.tree.tag_configure("tie", foreground="#b35c00")
         self.tree.tag_configure("ok", foreground="#1b7f2a")
-        ys = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        xs = ttk.Scrollbar(mid, orient="horizontal", command=self.tree.xview)
+        ys = ttk.Scrollbar(self.mid, orient="vertical", command=self.tree.yview)
+        xs = ttk.Scrollbar(self.mid, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         ys.grid(row=0, column=1, sticky="ns")
         xs.grid(row=1, column=0, sticky="ew")
-        mid.rowconfigure(0, weight=1)
-        mid.columnconfigure(0, weight=1)
+        self.mid.rowconfigure(0, weight=1)
+        self.mid.columnconfigure(0, weight=1)
         self.tree.bind("<Double-1>", lambda e: self.pick_manual())
 
-        bot = ttk.Frame(root, padding=p)
-        bot.pack(fill="x")
-        self.btn_search = ttk.Button(bot, text="フォルダから探す…", command=self.ask_search)
+        self.bot = ttk.Frame(root)
+        self.bot.pack(fill="x")
+        self.btn_search = ttk.Button(self.bot, text="フォルダから探す…", command=self.ask_search)
         self.btn_search.pack(side="left")
-        ttk.Button(bot, text="選んだ行を手で指定…", command=self.pick_manual).pack(side="left", padx=p)
-        ttk.Button(bot, text="選んだ行の指定を外す", command=self.clear_selected).pack(side="left")
-        self.btn_save = ttk.Button(bot, text="保存（バックアップを残す）", command=self.save)
+        self.btn_manual = ttk.Button(self.bot, text="選んだ行を手で指定…", command=self.pick_manual)
+        self.btn_manual.pack(side="left")
+        ttk.Button(self.bot, text="選んだ行の指定を外す", command=self.clear_selected).pack(side="left")
+        self.btn_save = ttk.Button(self.bot, text="保存（バックアップを残す）", command=self.save)
         self.btn_save.pack(side="right")
-        self.status = ttk.Label(root, padding=(p, 0, p, p), text="")
+        self.status = ttk.Label(root, text="")
         self.status.pack(fill="x")
+        self.show_proj_column()
+        self.apply_scale()
+        # 最小サイズは一番小さい拡大率で決める。今のモニタの値だと、縮小側のモニタへ移ったとき
+        # Windows が示す大きさが最小サイズで止められ、窓の大半が元のモニタに残って行き来する
+        S0 = min_scale()
+        root.minsize(int(640 * S0), int(320 * S0))
+        root.bind("<Configure>", self.on_configure)
+        self.hooked = self.hook_dpi_changed()
+
+    # ---- モニタの拡大率
+
+    def hook_dpi_changed(self):
+        """拡大率の違うモニタへ移ったとき、Windows が示す位置と大きさ（WM_DPICHANGED）へ窓を合わせる。
+        Tk はこの通知を処理しない。自前で左上を固定して大きさだけ変えると、ドラッグ中に窓の大半が載る
+        モニタが入れ替わって拡大と縮小を繰り返し、窓が境目で止まる（2026-09-12 実測）。
+        窓プロシージャの差し替えは C の DLL で行う。ctypes のコールバックで差し替えると、
+        tkinter の GIL の受け渡しと衝突して起動直後に落ちる（同日実測）。"""
+        self._dpihook = load_dpihook()  # DLL を解放させない
+        return bool(self._dpihook and self._dpihook.hook_dpi_changed(int(self.root.wm_frame(), 16)))
+
+    def apply_scale(self):
+        """self.S に合わせて余白・行の高さ・最小サイズを決め直す。"""
+        S, p = self.S, int(6 * self.S)
+        self.top.configure(padding=p)
+        self.mid.configure(padding=(p, 0))
+        self.bot.configure(padding=p)
+        self.status.configure(padding=(p, 0, p, p))
+        self.info.pack_configure(padx=p)
+        self.btn_manual.pack_configure(padx=p)
+        ttk.Style(self.root).configure("Treeview", rowheight=int(24 * S))
+
+    def on_configure(self, event):
+        """拡大率の違うモニタへ移ったら、文字・列幅・余白を掛け直す（窓の大きさは hook_dpi_changed が合わせる）。"""
+        if event.widget is not self.root:
+            return
+        S = window_scale(self.root)
+        if abs(S - self.S) < 0.01:
+            return
+        r, self.S = S / self.S, S
+        self.root.tk.call("tk", "scaling", S * 96 / 72)
+        for name in FONTS:  # 同じ pt で設定し直すと、新しい scaling で px が計算し直される
+            f = tkfont.nametofont(name)
+            f.configure(size=f.cget("size"))
+        for key, *_ in self.COLS:
+            self.tree.column(key, width=int(self.tree.column(key, "width") * r))
+        self.apply_scale()
+        if not self.hooked:  # DLL が無いときは、せめて大きさだけ合わせる（ドラッグ中は行き来することがある）
+            self.root.geometry(f"{int(self.root.winfo_width() * r)}x{int(self.root.winfo_height() * r)}")
 
     # ---- 読み込み
 
@@ -235,12 +330,16 @@ class App:
                 self.docs.append(Aup2(p))
             except (OSError, UnicodeDecodeError) as e:
                 errors.append(f"{p}\n  {e}")
-        counts, self.total = {}, 0
-        for d in self.docs:
+        counts, projs, self.total = {}, {}, 0
+        for d, label in zip(self.docs, doc_labels([d.path for d in self.docs])):
             for _, _, v in d.refs:
                 self.total += 1
                 counts[v] = counts.get(v, 0) + 1
-        self.rows = {v: {"count": c, "new": None, "note": "未解決"} for v, c in counts.items() if not os.path.exists(v)}
+                if label not in projs.setdefault(v, []):
+                    projs[v].append(label)
+        self.rows = {v: {"count": c, "new": None, "note": "未解決", "proj": "、".join(projs[v])}
+                     for v, c in counts.items() if not os.path.exists(v)}
+        self.show_proj_column()
         self.refresh()
         if errors:
             messagebox.showwarning(APP, "読めなかったファイル:\n\n" + "\n".join(errors), parent=self.root)
@@ -249,14 +348,19 @@ class App:
         elif self.rows:
             self.status.config(text="「フォルダから探す」で移動先のフォルダを選ぶと、同じ名前のファイルを探します。")
 
+    def show_proj_column(self):
+        """「プロジェクト」列は .aup2 を 2 本以上開いたときだけ出す。"""
+        many = len(self.docs) > 1
+        self.tree.configure(displaycolumns=[c[0] for c in self.COLS if many or c[0] != "proj"])
+
     def refresh(self):
         sel = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
-        for old, r in sorted(self.rows.items(), key=lambda kv: kv[0].lower()):
+        for old, r in sorted(self.rows.items(), key=lambda kv: (kv[1]["proj"].lower(), kv[0].lower())):
             new = r["new"]
             tag = "none" if not new else "tie" if r["note"].startswith("候補") else "ok"
             self.tree.insert("", "end", iid=old, tags=(tag,), values=(
-                r["note"], ntpath.basename(old), ntpath.dirname(old),
+                r["note"], ntpath.basename(old), r["proj"], ntpath.dirname(old),
                 ntpath.dirname(new) if new else "", r["count"]))
         keep = [s for s in sel if self.tree.exists(s)]
         if keep:
@@ -391,7 +495,27 @@ class App:
             self.root.destroy()
 
 
+def shortcut(remove=False):
+    """スタートメニューのショートカットを作る / 消す。AviUtl2 カタログから入れたときの起動口
+    （カタログは exe を隠れたフォルダに置くだけなので、インストール手順から --install で呼ぶ）。"""
+    lnk = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Start Menu", "Programs", APP + ".lnk")
+    if remove:
+        if os.path.exists(lnk):
+            os.remove(lnk)
+        return 0
+    exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
+    # パスと説明は環境変数で渡す（日本語や空白を PowerShell の引用符に通さない）
+    env = dict(os.environ, A2R_LNK=lnk, A2R_EXE=exe, A2R_DESC="AviUtl2 の .aup2 で切れた素材のリンクを直す")
+    ps = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:A2R_LNK); "
+          "$s.TargetPath = $env:A2R_EXE; $s.WorkingDirectory = Split-Path $env:A2R_EXE; "
+          "$s.Description = $env:A2R_DESC; $s.Save()")
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                          env=env, creationflags=0x08000000).returncode  # CREATE_NO_WINDOW
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall"):
+        sys.exit(shortcut(remove=sys.argv[1] == "--uninstall"))
     try:
         user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except (AttributeError, OSError):
@@ -402,11 +526,10 @@ def main():
     except Exception:  # D&D が使えなくても「開く」ボタンで使える
         DND_FILES, root = None, tk.Tk()
     root.update_idletasks()
-    S = user32.GetDpiForWindow(int(root.wm_frame(), 16)) / 96 or 1
+    S = window_scale(root)
     root.tk.call("tk", "scaling", S * 96 / 72)
-    for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont"):
+    for name in FONTS:
         tkfont.nametofont(name).configure(family="Yu Gothic UI", size=10)
-    ttk.Style(root).configure("Treeview", rowheight=int(24 * S))
     app = App(root, S)
     if DND_FILES:
         root.drop_target_register(DND_FILES)

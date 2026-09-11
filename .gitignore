@@ -3,3 +3,4 @@ dist/
 release/
 *.spec
 __pycache__/
+*.dll
